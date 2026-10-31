@@ -35,6 +35,4 @@ def search_nomenclature_tool(query: str, limit: int = 10):
 
 
 if __name__ == "__main__":
-    print(search_nomenclature("horses"))
-    print(search_nomenclature("0101"))
-    print(search_nomenclature_tool("chocolate"))
+    print(search_nomenclature_tool(query="white chocolate containing no cocoa"))
