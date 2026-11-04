@@ -11,20 +11,26 @@ def search_nomenclature(string : str):
     returns
 
     """
+
+    dataFrame = df_nomenclature.copy()
+    dataFrame.insert(0,"score",0)
     query = string.strip()    #on supprime les espaces inutiles en début et en fin
 
-    mask = (
-        df_nomenclature["Text"]
-        .astype(str)
-        .str.contains(query, case=False, na=False, regex=False)
-        |
-        df_nomenclature["CN"]
-        .astype(str)
-        .str.contains(query, case=False, na=False, regex=False)
-    )
+    query_words = query.split()
 
-    results = df_nomenclature.loc[mask, ["CN","Text","Unit"]]
-    return results
+    for i in range(len(query_words)):
+        mask = (
+            dataFrame["Text"]
+            .astype(str)
+            .str.contains(query_words[i], case=False, na=False, regex=False)
+            |
+            dataFrame["CN"]
+            .astype(str)
+            .str.contains(query_words[i], case=False, na=False, regex=False)
+        )
+        dataFrame.loc[mask, ["score"]] += 1
+    dataFrameFiltered = dataFrame[dataFrame["score"] > 0]
+    return dataFrameFiltered.sort_values(by="score", ascending=False)
 
 def search_nomenclature_tool(query: str, limit: int = 10):
     df = search_nomenclature(query)
@@ -35,4 +41,5 @@ def search_nomenclature_tool(query: str, limit: int = 10):
 
 
 if __name__ == "__main__":
-    print(search_nomenclature_tool(query="white chocolate containing no cocoa"))
+    query = "white chocolate containing cocoa"
+    print(search_nomenclature(query))
