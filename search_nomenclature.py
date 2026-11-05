@@ -9,7 +9,9 @@ def search_nomenclature(string : str):
         string (str): la chaîne que l'on souhaite rechercher
     
     returns
-
+        pandas.DataFrame : contenant une colonne de plus avec un score,
+                            indiquant le nombre de mots de la requete trouves dans le texte,
+                            et trie par ordre decroissant du score
     """
 
     dataFrame = df_nomenclature.copy()
