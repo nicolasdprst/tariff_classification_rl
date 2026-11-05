@@ -1,6 +1,9 @@
+from pathlib import Path
+
 import pandas as pd
 
-df_nomenclature = pd.read_excel("nomenclature.xlsx", header=4)
+NOMENCLATURE_PATH = Path(__file__).resolve().parents[1] / "data" / "reference" / "nomenclature.xlsx"
+df_nomenclature = pd.read_excel(NOMENCLATURE_PATH, header=4)
 
 def get_code_details(string: str):
 

@@ -1,4 +1,4 @@
-from classify_product import classify_product
+from src.classify_product import classify_product
 import json
 
 dataset_path = "data/validation_eu_en_tiny.jsonl"

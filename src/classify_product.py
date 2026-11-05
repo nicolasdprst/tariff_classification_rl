@@ -1,6 +1,6 @@
 import json
 from ollama import chat 
-from search_nomenclature import search_nomenclature_tool
+from src.search_nomenclature import search_nomenclature_tool
 
 MODEL = "qwen3:1.7b"
 

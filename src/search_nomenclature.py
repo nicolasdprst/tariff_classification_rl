@@ -1,9 +1,12 @@
-from idf_score import idf_score
+from pathlib import Path
+
+from src.idf_score import idf_score
 import pandas as pd
 import re
 
 
-df_nomenclature = pd.read_excel("nomenclature.xlsx", header=4)  #3 colonnes : Texte, CN et Unit
+NOMENCLATURE_PATH = Path(__file__).resolve().parents[1] / "data" / "reference" / "nomenclature.xlsx"
+df_nomenclature = pd.read_excel(NOMENCLATURE_PATH, header=4)  #3 colonnes : Texte, CN et Unit
 
 def search_nomenclature(string : str):
     """Recherche une chaîne de caractère dans la nomenclature
