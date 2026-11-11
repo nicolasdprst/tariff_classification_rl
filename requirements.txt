@@ -1,5 +1,3 @@
 pandas
 openpyxl
 ollama
-re
-math
