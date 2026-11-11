@@ -112,9 +112,13 @@ def classify_product(query: str) -> dict:
     if not isinstance(result["description"], str):
         raise ValueError("description doit être une chaîne")
 
+    if result["cn_code"] is not None:
+        result["cn_code"] = "".join(result["cn_code"].split())   #on normalise la sortie sans espace
+
     return result
 
 if __name__ == "__main__":
     result = classify_product(query="muzzle-loading firearm")
+    print("Query : muzzle-loading firearm")
     print(result)
 
