@@ -35,7 +35,7 @@ def search_nomenclature(string : str):
             |
             dataFrame["CN"]
             .astype(str)
-            .str.contains(query_words[i], case=False, na=False)
+            .str.contains(query_words[i], case=False, na=False, regex=False)
         )
         dataFrame.loc[mask, ["score"]] += idf_score(query_words[i],dataFrame)
 
