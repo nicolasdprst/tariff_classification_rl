@@ -1,8 +1,9 @@
-import pandas as pd
-from pathlib import Path
+from src.search_nomenclature import df_nomenclature
 
-NOMENCLATURE_PATH = Path(__file__).resolve().parents[1] / "data" / "reference" / "nomenclature.xlsx"
-df_nomenclature = pd.read_excel(NOMENCLATURE_PATH, header=4)  #3 colonnes : Texte, CN et Unit
+normalized_nomenclature = df_nomenclature[["CN", "Text"]].copy()
+normalized_nomenclature["normalized_cn"] = (
+    normalized_nomenclature["CN"].astype(str).str.replace(" ", "", regex=False)
+)
 
 
 def get_subcategories(code: str) -> list[dict]:
@@ -15,13 +16,9 @@ def get_subcategories(code: str) -> list[dict]:
     if len(code) == 8:
         return []
 
-    nomenclature = df_nomenclature[["CN", "Text"]].copy()               #on copie la nomenclature et on garde que le code et la description
-    nomenclature["normalized_cn"] = (
-        nomenclature["CN"].astype(str).str.replace(" ", "", regex=False)      #on enlève les espaces dans les codes
-    )
-    descendants = nomenclature[                                                #on trouve tous les descendants
-        nomenclature["normalized_cn"].str.startswith(code)
-        & (nomenclature["normalized_cn"].str.len() > len(code))
+    descendants = normalized_nomenclature[                              #on trouve tous les descendants
+        normalized_nomenclature["normalized_cn"].str.startswith(code)
+        & (normalized_nomenclature["normalized_cn"].str.len() > len(code))
     ]
 
     descendant_codes = set(descendants["normalized_cn"])
