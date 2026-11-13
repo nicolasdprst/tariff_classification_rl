@@ -10,7 +10,7 @@ def validate_cn8(predicted_code: str | None, valid_codes: set[str]) -> tuple[str
     if not isinstance(predicted_code, str):
         return None, "Format invalide"
 
-    code = re.sub(r"[\s.]", "", predicted_code)           #on formate la réponse en enlevant les . et les espaces
+    code = re.sub(r"[\s.\-]", "", predicted_code)          #on enlève les séparateurs d'affichage
 
     if not code:           
         return None, "Il manque le code"

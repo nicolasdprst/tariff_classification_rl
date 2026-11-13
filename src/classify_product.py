@@ -1,5 +1,6 @@
 from src.get_subcategories import get_subcategories
 import json
+import re
 from ollama import chat 
 from src.search_nomenclature import search_nomenclature_tool
 
@@ -84,7 +85,16 @@ def classify_product(query: str) -> dict:
 
             arg = appel_tool.function.arguments
             print("Arguments générés par Qwen:", arg)
-            result = tool_handler(**arg)
+            try:
+                result = tool_handler(**arg)
+            except (TypeError, ValueError) as err:
+                # Erreur rencontré notamment : le SLM cherche un code à 10chiffres car le prompt peut l'influencer
+                # à chercher un code TARIC (8 + 2) et non un code CN (sans les deux derniers), on le précise donc
+                # au SLM au lieu de juste tronqué sa réponse qui n'est pas forcément correcte
+                result = {
+                    "error": str(err),
+                    "invalid_arguments": arg,
+                }
             print("Résultats de la recherche:", result)
 
             messages.append({
@@ -123,7 +133,9 @@ def classify_product(query: str) -> dict:
         raise ValueError("description doit être une chaîne")
 
     if result["cn_code"] is not None:
-        result["cn_code"] = "".join(result["cn_code"].split())   #on normalise la sortie sans espace
+        # La validité est évaluée ensuite par validate_cn8. Une mauvaise
+        # prédiction est ainsi comptée comme invalide sans arrêter tout le lot.
+        result["cn_code"] = re.sub(r"[\s.\-]", "", result["cn_code"])
 
     return result
 

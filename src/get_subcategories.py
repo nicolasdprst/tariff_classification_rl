@@ -1,3 +1,5 @@
+import re
+
 from src.search_nomenclature import df_nomenclature
 
 normalized_nomenclature = df_nomenclature[["CN", "Text"]].copy()
@@ -10,9 +12,22 @@ def get_subcategories(code: str) -> list[dict]:
     """
     Retourne les sous-catégories directes d'un code tarifaire.
     """
-    code = "".join(code.split())                                         #on enlève les espaces dans les codes
-    if not code.isdigit() or len(code) not in {2, 4, 6, 8}:              #si le code ne fait pas la taille requise -> erreur
-        raise ValueError("Le code doit contenir 2, 4, 6 ou 8 chiffres")
+    if not isinstance(code, str):
+        raise ValueError("Le code CN doit être une chaîne de caractères")
+
+    # Les séparateurs d'affichage ne font pas partie du code douanier.
+    code = re.sub(r"[\s.\-]", "", code)
+    if code.isdigit() and len(code) == 10:
+        raise ValueError(
+            "Code TARIC à 10 chiffres reçu. Cet outil attend un code CN "
+            "de 2, 4, 6 ou 8 chiffres ; choisissez un code CN à partir "
+            "des résultats de recherche, sans inventer de subdivision."
+        )
+    if not code.isdigit() or len(code) not in {2, 4, 6, 8}:
+        raise ValueError(
+            "Le code CN doit contenir 2, 4, 6 ou 8 chiffres, "
+            "hors espaces, points ou tirets"
+        )
     if len(code) == 8:
         return []
 
