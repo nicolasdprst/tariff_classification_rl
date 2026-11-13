@@ -1,3 +1,4 @@
+from src.get_subcategories import get_subcategories
 import json
 from ollama import chat 
 from src.search_nomenclature import search_nomenclature_tool
@@ -14,6 +15,8 @@ SEARCH RULES:
 2. Search using short product keywords, not full descriptions.
 3. Use the tool results as your primary source of evidence.
 4. An empty search result does not mean the product has no classification.
+5. Use get_subcategories with a CN code to retrieve its direct child categories.
+6. Codes may contain 2, 4, 6, or 8 digits; an 8-digit code is a leaf and returns an empty list.
 
 CLASSIFICATION RULES:
 1. Select the most specific CN code supported by the product
@@ -50,6 +53,11 @@ Do not include explanations outside the JSON object.
 """
 
 MAX_TOOL_CALLS = 5
+TOOLS = [search_nomenclature_tool, get_subcategories]
+TOOL_HANDLERS = {
+    tool.__name__: tool
+    for tool in TOOLS
+}
 
 def classify_product(query: str) -> dict:
     round = 0       
@@ -64,17 +72,19 @@ def classify_product(query: str) -> dict:
         }
     ]
 
-    response = chat(model=MODEL, messages=messages, tools=[search_nomenclature_tool])
+    response = chat(model=MODEL, messages=messages, tools=TOOLS)
 
     messages.append(response.message)
     while response.message.tool_calls and round < MAX_TOOL_CALLS :  #on vérifie si c'est vide ou non
         for appel_tool in response.message.tool_calls:
-            if appel_tool.function.name != "search_nomenclature_tool":
+            tool_name = appel_tool.function.name
+            tool_handler = TOOL_HANDLERS.get(tool_name)
+            if tool_handler is None:
                 raise ValueError(f"L'outil souhaité ({appel_tool.function.name}) n'existe pas")
 
             arg = appel_tool.function.arguments
             print("Arguments générés par Qwen:", arg)
-            result = search_nomenclature_tool(**arg)
+            result = tool_handler(**arg)
             print("Résultats de la recherche:", result)
 
             messages.append({
@@ -83,11 +93,11 @@ def classify_product(query: str) -> dict:
                 "content" : json.dumps(result, ensure_ascii=False)
             })
         round+=1
-        response = chat(model=MODEL, messages=messages, tools=[search_nomenclature_tool])
+        response = chat(model=MODEL, messages=messages, tools=TOOLS)
         messages.append(response.message)
     
     if response.message.tool_calls:             #si on a depassé la limite, on  informe
-        raise ValueError(f"nombre d'appels à 'search_nomenclature_tool' dépassé ({MAX_TOOL_CALLS})")
+        raise ValueError(f"Nombre de tours d'appels d'outils dépassé ({MAX_TOOL_CALLS})")
     try:
         result = json.loads(response.message.content)
     except json.JSONDecodeError as err:
