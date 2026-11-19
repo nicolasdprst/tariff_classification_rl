@@ -4,6 +4,7 @@ from src.get_valid_codes import get_valid_codes
 from src.code_validation import validate_cn8
 from collections import Counter
 import json
+import pandas as pd
 
 dataset_path = "data/validation_eu_en_tiny.jsonl"
 
@@ -68,3 +69,5 @@ if __name__ == "__main__":
     print(f"Accuracy: {metrics['accuracy']:.4f}")
     print(f"Mean reward: {metrics['mean_reward']:.4f}")
     print(f"Invalid rate: {metrics['invalid_rate']:.2%}")
+    df = pd.DataFrame(results)
+    df.to_csv("evaluation_results.csv", index=False)
