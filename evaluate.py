@@ -57,8 +57,9 @@ def evaluate():
         Counter(results["code_status"])
     )
 
-    metrics["invalid_rate"] = (sum(status != "valid"for status in results["code_status"]) / len(results["code_status"])
-    )
+    metrics["invalid_rate"] = sum(
+        status != "valid" for status in results["code_status"]
+    ) / len(results["code_status"])
     return results, metrics
 
 if __name__ == "__main__":

@@ -36,6 +36,10 @@ def get_subcategories(code: str) -> list[dict]:
         & (normalized_nomenclature["normalized_cn"].str.len() > len(code))
     ]
 
+    # sans descendant, il n'y a aucun enfant direct
+    if descendants.empty:
+        return []
+
     descendant_codes = set(descendants["normalized_cn"])
     direct_children = descendants[
         descendants["normalized_cn"].map(

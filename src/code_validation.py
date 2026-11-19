@@ -24,4 +24,4 @@ def validate_cn8(predicted_code: str | None, valid_codes: set[str]) -> tuple[str
     if code not in valid_codes:              #si le code est à un format correct mais n'étant pas dans la liste des codes existants
         return code, "Format valide mais code inconnu"
 
-    return code, "Code valide"
+    return code, "valid"
