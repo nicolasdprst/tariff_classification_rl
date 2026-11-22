@@ -210,7 +210,7 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
                 raise ValueError(f"L'outil souhaité ({tool_name}) n'existe pas")
 
             arguments = tool_call.function.arguments
-            print("Arguments générés par Qwen:", arguments)
+            print("Arguments générés par le SLM:", arguments)
             try:
                 tool_result = tool_handler(**arguments)
             except (TypeError, ValueError) as err:

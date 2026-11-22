@@ -1,6 +1,6 @@
 import re
 from pathlib import Path
-from pandas import pd 
+import pandas as pd 
 
 NOMENCLATURE_PATH = Path(__file__).resolve().parents[1] / "data" / "reference" / "nomenclature.xlsx"
 df_nomenclature = pd.read_excel(NOMENCLATURE_PATH, header=4)
