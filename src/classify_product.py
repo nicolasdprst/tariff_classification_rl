@@ -5,7 +5,7 @@ from ollama import chat
 from src.code_validation import get_valid_taric_prefix, validate_cn8
 from src.get_subcategories import get_subcategories
 from src.get_valid_codes import get_valid_codes
-from src.search_nomenclature import search_nomenclature_tool
+from src.meilisearch.index_nomenclature import search_nomenclature_tool
 
 
 MODEL = "qwen3:1.7b"

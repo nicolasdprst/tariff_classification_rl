@@ -1,6 +1,9 @@
 import re
+from pathlib import Path
+from pandas import pd 
 
-from src.search_nomenclature import df_nomenclature
+NOMENCLATURE_PATH = Path(__file__).resolve().parents[1] / "data" / "reference" / "nomenclature.xlsx"
+df_nomenclature = pd.read_excel(NOMENCLATURE_PATH, header=4)
 
 normalized_nomenclature = df_nomenclature[["CN", "Text"]].copy()
 normalized_nomenclature["normalized_cn"] = (
