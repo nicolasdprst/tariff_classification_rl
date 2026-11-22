@@ -9,7 +9,7 @@ from src.get_valid_codes import get_valid_codes
 from src.reward import calculate_reward
 
 
-DATASET_PATH = "data/validation_eu_en_tiny.jsonl"
+DATASET_PATH = "data/cleaned/validation_eu_en_tiny.jsonl"
 
 
 def _rate(values: list[bool]) -> float:
