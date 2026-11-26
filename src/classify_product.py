@@ -88,17 +88,6 @@ OUTPUT_SCHEMA = {
 }
 
 
-def _legacy_chat(messages: list[dict], tools=None):
-    """Appeller Ollama avec une sortie controlée."""
-    return chat(
-        model=MODEL,
-        messages=messages,
-        tools=tools,
-        format=OUTPUT_SCHEMA,
-        options={"temperature": 0},
-    )
-
-
 def _chat(messages: list[dict], tools=None, structured: bool = False):
     """Keep tool calling and structured output in separate requests."""
     arguments = {
@@ -133,12 +122,19 @@ def _tool_calls(message) -> list:
     )]
 
 
-def _structured_response(messages: list[dict]):
+def _structured_response(messages: list[dict], terminal_code: str | None = None):
+    terminal_instruction = (
+        f" The selected code {terminal_code} is an official terminal CN8; "
+        "return it if it is the intended classification."
+        if terminal_code
+        else ""
+    )
     final_messages = messages + [{
         "role": "user",
         "content": (
             "Now return the final classification as the requested JSON object. "
             "Use only evidence from the tool results."
+            f"{terminal_instruction}"
         ),
     }]
     return _chat(messages=final_messages, structured=True)
@@ -244,6 +240,7 @@ def _request_unknown_code_correction(messages: list, invalid_code: str) -> dict:
 
 
 def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
+    valid_codes = valid_codes if valid_codes is not None else get_valid_codes()
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": query},
@@ -253,6 +250,7 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
 
     tool_round = 0
     seen_tool_calls = set()
+    terminal_code = None
     pending_calls = _tool_calls(response.message)
     while pending_calls and tool_round < MAX_TOOL_CALLS:
         for tool_call in pending_calls:
@@ -263,6 +261,29 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
 
             arguments = tool_call.function.arguments
             print("Arguments générés par le SLM:", arguments)
+            requested_code = ""
+            if tool_name == "get_subcategories":
+                requested_code = "".join(
+                    character
+                    for character in str(arguments.get("code", ""))
+                    if character.isdigit()
+                )
+            if len(requested_code) == 8 and requested_code in valid_codes:
+                terminal_code = requested_code
+                tool_result = {
+                    "terminal_cn8": terminal_code,
+                    "instruction": (
+                        "This is already an official terminal CN8. Stop using "
+                        "tools and return the final classification."
+                    ),
+                }
+                print("Résultats de la recherche:", tool_result)
+                messages.append({
+                    "role": "tool",
+                    "tool_name": tool_name,
+                    "content": json.dumps(tool_result, ensure_ascii=False),
+                })
+                break
             signature = (tool_name, json.dumps(arguments, sort_keys=True))
             if signature in seen_tool_calls:
                 tool_result = {
@@ -289,21 +310,22 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
                 "content": json.dumps(tool_result, ensure_ascii=False),
             })
 
+        if terminal_code is not None:
+            break
         tool_round += 1
         response = _chat(messages=messages, tools=TOOLS)
         messages.append(response.message)
         pending_calls = _tool_calls(response.message)
 
-    if pending_calls:
+    if pending_calls and terminal_code is None:
         raise ValueError(
             f"Nombre de tours d'appels d'outils dépassé ({MAX_TOOL_CALLS})"
         )
 
     raw_result = _parse_classification(
-        _structured_response(messages).message.content
+        _structured_response(messages, terminal_code).message.content
     )
     raw_code = raw_result["cn_code"]
-    valid_codes = valid_codes if valid_codes is not None else get_valid_codes()
     raw_normalized, raw_code_status = validate_cn8(raw_code, valid_codes)
 
     result = dict(raw_result)

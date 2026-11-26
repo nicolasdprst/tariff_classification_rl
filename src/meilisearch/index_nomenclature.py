@@ -151,7 +151,7 @@ def search_nomenclature(
     """Recherche un libelle ou un code CN et retourne les resultats."""
 
     if limit < 1:
-        raise ValueError("limit doit etre superieur ou egal a 1")
+        raise ValueError("The search limit must be greater than or equal to 1.")
 
     client = client or get_client()
     index = client.index(index_uid or os.getenv("MEILISEARCH_INDEX", DEFAULT_INDEX))
@@ -175,7 +175,7 @@ def search_nomenclature(
 
 
 def search_nomenclature_tool(query: str, limit: int = 5) -> list[dict[str, Any]]:
-    """Tool Ollama : recherche des candidats CN dans l'index Meilisearch"""
+    """Search the official CN nomenclature for candidate codes and labels."""
 
     return search_nomenclature(query=query, limit=limit)
 
