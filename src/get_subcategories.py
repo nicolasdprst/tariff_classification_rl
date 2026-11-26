@@ -12,27 +12,28 @@ normalized_nomenclature["normalized_cn"] = (
 
 
 def get_subcategories(code: str) -> list[dict]:
-    """
-    Retourne les sous-catégories directes d'un code tarifaire.
-    """
+    """Return the direct child categories of a 2-, 4-, or 6-digit CN code."""
     if not isinstance(code, str):
-        raise ValueError("Le code CN doit être une chaîne de caractères")
+        raise ValueError("The CN code must be a string.")
 
     # Les séparateurs d'affichage ne font pas partie du code douanier.
     code = re.sub(r"[\s.\-]", "", code)
     if code.isdigit() and len(code) == 10:
         raise ValueError(
-            "Code TARIC à 10 chiffres reçu. Cet outil attend un code CN "
-            "de 2, 4, 6 ou 8 chiffres ; choisissez un code CN à partir "
-            "des résultats de recherche, sans inventer de subdivision."
+            "A 10-digit TARIC code was provided. This tool accepts only "
+            "2-, 4-, or 6-digit CN parent codes. Select a CN code from the "
+            "search results and do not invent a subdivision."
         )
     if not code.isdigit() or len(code) not in {2, 4, 6, 8}:
         raise ValueError(
-            "Le code CN doit contenir 2, 4, 6 ou 8 chiffres, "
-            "hors espaces, points ou tirets"
+            "The CN code must contain 2, 4, or 6 digits, excluding display "
+            "spaces, dots, or hyphens."
         )
     if len(code) == 8:
-        return []
+        raise ValueError(
+            f"Code {code} is already a terminal CN8 code and has no child "
+            "categories. Stop using tools and return the final classification."
+        )
 
     descendants = normalized_nomenclature[                              #on trouve tous les descendants
         normalized_nomenclature["normalized_cn"].str.startswith(code)

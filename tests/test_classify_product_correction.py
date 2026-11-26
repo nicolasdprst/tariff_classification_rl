@@ -37,7 +37,12 @@ def _tool_response():
 
 
 def test_unknown_cn8_is_replaced_only_by_an_official_code(monkeypatch):
-    responses = iter([_response("12345678"), _response("94039910")])
+    responses = iter([
+        _response(None, status="uncertain"),
+        _response("12345678"),
+        _response(None, status="uncertain"),
+        _response("94039910"),
+    ])
     monkeypatch.setattr(classify_module, "_chat", lambda **kwargs: next(responses))
 
     result = classify_module.classify_product(
@@ -55,7 +60,12 @@ def test_unknown_cn8_is_replaced_only_by_an_official_code(monkeypatch):
 
 
 def test_second_unknown_cn8_becomes_uncertain_without_hiding_raw(monkeypatch):
-    responses = iter([_response("12345678"), _response("87654321")])
+    responses = iter([
+        _response(None, status="uncertain"),
+        _response("12345678"),
+        _response(None, status="uncertain"),
+        _response("87654321"),
+    ])
     monkeypatch.setattr(classify_module, "_chat", lambda **kwargs: next(responses))
 
     result = classify_module.classify_product(
@@ -73,9 +83,8 @@ def test_second_unknown_cn8_becomes_uncertain_without_hiding_raw(monkeypatch):
 
 
 def test_valid_raw_cn8_does_not_trigger_correction(monkeypatch):
-    monkeypatch.setattr(
-        classify_module, "_chat", lambda **kwargs: _response("94039910")
-    )
+    responses = iter([_response(None, status="uncertain"), _response("94039910")])
+    monkeypatch.setattr(classify_module, "_chat", lambda **kwargs: next(responses))
 
     result = classify_module.classify_product(
         "product", valid_codes={"94039910"}
@@ -94,3 +103,36 @@ def test_unknown_code_correction_has_an_explicit_tool_limit(monkeypatch):
 
     with pytest.raises(ValueError, match="pendant la correction"):
         classify_module._request_unknown_code_correction([], "12345678")
+
+
+def test_tool_and_structured_requests_are_separate(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        classify_module,
+        "chat",
+        lambda **kwargs: calls.append(kwargs) or _response(None, status="uncertain"),
+    )
+
+    classify_module._chat([], tools=classify_module.TOOLS)
+    classify_module._chat([], structured=True)
+
+    assert "tools" in calls[0]
+    assert calls[0]["think"] is True
+    assert "format" not in calls[0]
+    assert "format" in calls[1]
+    assert "tools" not in calls[1]
+
+
+def test_textual_qwen_tool_call_is_recovered():
+    message = SimpleNamespace(
+        content=json.dumps({
+            "name": "search_nomenclature_tool",
+            "arguments": {"query": "grinding discs", "limit": 5},
+        }),
+        tool_calls=[],
+    )
+
+    calls = classify_module._tool_calls(message)
+
+    assert calls[0].function.name == "search_nomenclature_tool"
+    assert calls[0].function.arguments["query"] == "grinding discs"
