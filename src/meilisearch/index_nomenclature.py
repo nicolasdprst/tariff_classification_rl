@@ -24,8 +24,20 @@ DEFAULT_URL = "http://localhost:7700"
 DEFAULT_INDEX = "nomenclature"
 
 INDEX_SETTINGS: dict[str, Any] = {
-    "searchableAttributes": ["text", "code", "code_normalized"],
-    "displayedAttributes": ["id", "code", "text", "unit"],
+    "searchableAttributes": [
+        "hierarchy_text",
+        "text",
+        "code",
+        "code_normalized",
+    ],
+    "displayedAttributes": [
+        "id",
+        "code",
+        "text",
+        "hierarchy_text",
+        "ancestor_codes",
+        "unit",
+    ],
     "filterableAttributes": ["has_code"],
     # Une faute de frappe acceptee dans un code douanier peut etre trompeuse.
     "typoTolerance": {"disableOnAttributes": ["code", "code_normalized"]},
@@ -57,7 +69,7 @@ def load_documents(path: Path = NOMENCLATURE_PATH) -> list[dict[str, Any]]:
         missing = ", ".join(sorted(missing_columns))
         raise ValueError(f"Colonnes absentes du fichier de nomenclature : {missing}")
 
-    documents: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for row_number, row in dataframe.iterrows():
         code = _clean_cell(row["CN"])
         text = _clean_cell(row["Text"])
@@ -65,16 +77,41 @@ def load_documents(path: Path = NOMENCLATURE_PATH) -> list[dict[str, Any]]:
         if not code and not text and not unit:
             continue
 
-        documents.append(
-            {
-                "id": f"cn_{row_number + 1:05d}",
-                "code": code,
-                "code_normalized": re.sub(r"\s+", "", code),
-                "text": text,
-                "unit": unit,
-                "has_code": bool(code),
-            }
-        )
+        rows.append({
+            "id": f"cn_{row_number + 1:05d}",
+            "code": code,
+            "code_normalized": re.sub(r"\s+", "", code),
+            "text": text,
+            "unit": unit,
+            "has_code": bool(code),
+        })
+
+    # Améliorer le contexte d'une recherche car certaines branches terminales ont juste "Other" comme
+    # descritpion ce qui ne permet pas au SLM de comprendre 
+    labels_by_code = {
+        row["code_normalized"]: row["text"]
+        for row in rows
+        if row["code_normalized"] and row["text"]
+    }
+
+    documents: list[dict[str, Any]] = []
+    for row in rows:
+        normalized = row["code_normalized"]
+        ancestor_codes = [
+            normalized[:depth]
+            for depth in range(2, len(normalized) + 1, 2)
+            if normalized[:depth] in labels_by_code
+        ]
+        hierarchy_labels = [labels_by_code[code] for code in ancestor_codes]
+        if row["text"] and (
+            not hierarchy_labels or hierarchy_labels[-1] != row["text"]
+        ):
+            hierarchy_labels.append(row["text"])
+
+        document = dict(row)
+        document["ancestor_codes"] = ancestor_codes[:-1]
+        document["hierarchy_text"] = " > ".join(hierarchy_labels)
+        documents.append(document)
 
     return documents
 
@@ -125,7 +162,13 @@ def search_nomenclature(
             # Les intertitres du classeur aident a l'indexation, mais ne sont
             # pas des classifications retournables puisqu'ils n'ont pas de CN.
             "filter": "has_code = true",
-            "attributesToRetrieve": ["code", "text", "unit"],
+            "attributesToRetrieve": [
+                "code",
+                "text",
+                "hierarchy_text",
+                "ancestor_codes",
+                "unit",
+            ],
         },
     )
     return response["hits"]
