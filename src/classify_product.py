@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 from ollama import chat
 
@@ -65,7 +66,7 @@ Return only the requested JSON object. Use an 8-digit CN code, or null when
 uncertain. Do not include Markdown or explanations outside JSON.
 """
 
-MAX_TOOL_CALLS = 5
+MAX_TOOL_CALLS = 7
 MAX_CORRECTION_TOOL_CALLS = 3
 TOOLS = [search_nomenclature_tool, get_subcategories]
 TOOL_HANDLERS = {tool.__name__: tool for tool in TOOLS}
@@ -87,7 +88,7 @@ OUTPUT_SCHEMA = {
 }
 
 
-def _chat(messages: list[dict], tools=None):
+def _legacy_chat(messages: list[dict], tools=None):
     """Appeller Ollama avec une sortie controlée."""
     return chat(
         model=MODEL,
@@ -96,6 +97,51 @@ def _chat(messages: list[dict], tools=None):
         format=OUTPUT_SCHEMA,
         options={"temperature": 0},
     )
+
+
+def _chat(messages: list[dict], tools=None, structured: bool = False):
+    """Keep tool calling and structured output in separate requests."""
+    arguments = {
+        "model": MODEL,
+        "messages": messages,
+        "options": {"temperature": 0},
+    }
+    if tools is not None:
+        arguments["tools"] = tools
+        arguments["think"] = True
+    if structured:
+        arguments["format"] = OUTPUT_SCHEMA
+    return chat(**arguments)
+
+
+def _tool_calls(message) -> list:
+    """Return native calls, or recover Qwen's textual tool-call JSON."""
+    if message.tool_calls:
+        return list(message.tool_calls)
+    try:
+        payload = json.loads((message.content or "").strip())
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    name = payload.get("name")
+    arguments = payload.get("arguments")
+    if name not in TOOL_HANDLERS or not isinstance(arguments, dict):
+        return []
+    return [SimpleNamespace(
+        function=SimpleNamespace(name=name, arguments=arguments)
+    )]
+
+
+def _structured_response(messages: list[dict]):
+    final_messages = messages + [{
+        "role": "user",
+        "content": (
+            "Now return the final classification as the requested JSON object. "
+            "Use only evidence from the tool results."
+        ),
+    }]
+    return _chat(messages=final_messages, structured=True)
 
 
 def _parse_classification(content: str) -> dict:
@@ -133,7 +179,7 @@ def _request_taric_correction(messages: list, candidate: str) -> dict:
         ),
     }]
     corrected = _parse_classification(
-        _chat(messages=correction_messages).message.content
+        _chat(messages=correction_messages, structured=True).message.content
     )
     if corrected["cn_code"] not in {candidate, None}:
         raise ValueError("La correction a proposé un autre code")
@@ -158,8 +204,9 @@ def _request_unknown_code_correction(messages: list, invalid_code: str) -> dict:
     correction_messages.append(response.message)
 
     tool_call_count = 0
-    while response.message.tool_calls:
-        for tool_call in response.message.tool_calls:
+    pending_calls = _tool_calls(response.message)
+    while pending_calls:
+        for tool_call in pending_calls:
             if tool_call_count >= MAX_CORRECTION_TOOL_CALLS:
                 raise ValueError(
                     "Nombre d'appels d'outils dépassé pendant la correction "
@@ -190,7 +237,10 @@ def _request_unknown_code_correction(messages: list, invalid_code: str) -> dict:
 
         response = _chat(messages=correction_messages, tools=TOOLS)
         correction_messages.append(response.message)
-    return _parse_classification(response.message.content)
+        pending_calls = _tool_calls(response.message)
+    return _parse_classification(
+        _structured_response(correction_messages).message.content
+    )
 
 
 def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
@@ -202,8 +252,10 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
     messages.append(response.message)
 
     tool_round = 0
-    while response.message.tool_calls and tool_round < MAX_TOOL_CALLS:
-        for tool_call in response.message.tool_calls:
+    seen_tool_calls = set()
+    pending_calls = _tool_calls(response.message)
+    while pending_calls and tool_round < MAX_TOOL_CALLS:
+        for tool_call in pending_calls:
             tool_name = tool_call.function.name
             tool_handler = TOOL_HANDLERS.get(tool_name)
             if tool_handler is None:
@@ -211,10 +263,25 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
 
             arguments = tool_call.function.arguments
             print("Arguments générés par le SLM:", arguments)
-            try:
-                tool_result = tool_handler(**arguments)
-            except (TypeError, ValueError) as err:
-                tool_result = {"error": str(err), "invalid_arguments": arguments}
+            signature = (tool_name, json.dumps(arguments, sort_keys=True))
+            if signature in seen_tool_calls:
+                tool_result = {
+                    "error": "Repeated tool call rejected.",
+                    "instruction": (
+                        "Do not repeat this search. Explore the most relevant "
+                        "2-, 4-, or 6-digit code already returned with "
+                        "get_subcategories, or finish as uncertain."
+                    ),
+                }
+            else:
+                seen_tool_calls.add(signature)
+                try:
+                    tool_result = tool_handler(**arguments)
+                except (TypeError, ValueError) as err:
+                    tool_result = {
+                        "error": str(err),
+                        "invalid_arguments": arguments,
+                    }
             print("Résultats de la recherche:", tool_result)
             messages.append({
                 "role": "tool",
@@ -225,13 +292,16 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
         tool_round += 1
         response = _chat(messages=messages, tools=TOOLS)
         messages.append(response.message)
+        pending_calls = _tool_calls(response.message)
 
-    if response.message.tool_calls:
+    if pending_calls:
         raise ValueError(
             f"Nombre de tours d'appels d'outils dépassé ({MAX_TOOL_CALLS})"
         )
 
-    raw_result = _parse_classification(response.message.content)
+    raw_result = _parse_classification(
+        _structured_response(messages).message.content
+    )
     raw_code = raw_result["cn_code"]
     valid_codes = valid_codes if valid_codes is not None else get_valid_codes()
     raw_normalized, raw_code_status = validate_cn8(raw_code, valid_codes)
