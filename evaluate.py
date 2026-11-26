@@ -16,7 +16,7 @@ from src.reward import calculate_reward
 DATASET_PATH = "data/reference/validation_eu_en_tiny.jsonl"
 DEFAULT_BATCH_SIZE = 8
 DEFAULT_MAX_WORKERS = 4
-DEFAULT_MAX_RETRIES = 2
+DEFAULT_MAX_RETRIES = 0
 RESULT_COLUMNS = [
     "id", "product_description", "raw_status", "status", "raw_predicted",
     "predicted_cn8", "ground_truth_cn8", "raw_code_status", "code_status",

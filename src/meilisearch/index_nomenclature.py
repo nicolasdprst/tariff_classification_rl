@@ -23,6 +23,11 @@ NOMENCLATURE_PATH = PROJECT_ROOT / "data" / "reference" / "nomenclature.xlsx"
 DEFAULT_URL = "http://localhost:7700"
 DEFAULT_INDEX = "nomenclature"
 
+QUERY_VARIANTS = {
+    "medium": "media",
+    "cell": "cells",
+}
+
 INDEX_SETTINGS: dict[str, Any] = {
     "searchableAttributes": [
         "hierarchy_text",
@@ -155,23 +160,53 @@ def search_nomenclature(
 
     client = client or get_client()
     index = client.index(index_uid or os.getenv("MEILISEARCH_INDEX", DEFAULT_INDEX))
-    response = index.search(
-        query.strip(),
-        {
-            "limit": limit,
-            # Les intertitres du classeur aident a l'indexation, mais ne sont
-            # pas des classifications retournables puisqu'ils n'ont pas de CN.
-            "filter": "has_code = true",
-            "attributesToRetrieve": [
-                "code",
-                "text",
-                "hierarchy_text",
-                "ancestor_codes",
-                "unit",
-            ],
-        },
-    )
-    return response["hits"]
+    search_options = {
+        "limit": limit,
+        # Les intertitres du classeur aident a l'indexation, mais ne sont
+        # pas des classifications retournables puisqu'ils n'ont pas de CN.
+        "filter": "has_code = true",
+        "attributesToRetrieve": [
+            "code",
+            "text",
+            "hierarchy_text",
+            "ancestor_codes",
+            "unit",
+        ],
+    }
+    variants = _query_variants(query)
+    response = index.search(variants[0], search_options)
+    if response["hits"]:
+        return [dict(hit, matched_query=variants[0]) for hit in response["hits"]]
+
+    # If the original query is empty, sample the top results from every
+    # simplified variant instead of stopping at the first weak lexical match.
+    fallback_hits = []
+    seen_codes = set()
+    for variant in variants[1:]:
+        response = index.search(variant, search_options)
+        for hit in response["hits"][:2]:
+            code = hit.get("code")
+            if code in seen_codes:
+                continue
+            seen_codes.add(code)
+            fallback_hits.append(dict(hit, matched_query=variant))
+    return fallback_hits[:limit]
+
+
+def _query_variants(query: str) -> list[str]:
+    """Build conservative fallbacks for an empty lexical search."""
+    words = re.sub(r"[_-]+", " ", query).strip().split()
+    candidates = [" ".join(words)]
+    normalized = [QUERY_VARIANTS.get(word.lower(), word) for word in words]
+    candidates.append(" ".join(normalized))
+
+    # Meilisearch's default strategy tends to keep the first term. Remove up
+    # to three leading qualifiers while retaining at least two product terms.
+    for start in range(1, min(4, max(1, len(words) - 1))):
+        candidates.append(" ".join(words[start:]))
+        candidates.append(" ".join(normalized[start:]))
+
+    return list(dict.fromkeys(candidate for candidate in candidates if candidate))
 
 
 def search_nomenclature_tool(query: str, limit: int = 5) -> list[dict[str, Any]]:

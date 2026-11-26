@@ -87,6 +87,23 @@ OUTPUT_SCHEMA = {
     "additionalProperties": False,
 }
 
+ABSTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "customs_nature": {"type": "string"},
+        "material": {"type": "string"},
+        "function": {"type": "string"},
+        "search_queries": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 2,
+        },
+    },
+    "required": ["customs_nature", "material", "function", "search_queries"],
+    "additionalProperties": False,
+}
+
 
 def _chat(messages: list[dict], tools=None, structured: bool = False):
     """Keep tool calling and structured output in separate requests."""
@@ -138,6 +155,44 @@ def _structured_response(messages: list[dict], terminal_code: str | None = None)
         ),
     }]
     return _chat(messages=final_messages, structured=True)
+
+
+def _abstract_product(description: str) -> dict:
+    """Extract stable customs concepts before lexical retrieval."""
+    prompt = (
+        "Abstract this product into customs-search terminology. Focus on what "
+        "the product is, its material, and its primary function. Ignore brands, "
+        "certifications, marketing language, dimensions, and intended users. "
+        "Provide one or two short search queries of 2-5 generic commodity "
+        "terms. Prefer nomenclature wording over wording copied from the "
+        f"description.\n\nPRODUCT DESCRIPTION:\n{description}"
+    )
+    response = chat(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        format=ABSTRACTION_SCHEMA,
+        think=False,
+        options={"temperature": 0, "num_predict": 256},
+    )
+    try:
+        profile = json.loads(response.message.content)
+        queries = profile.get("search_queries")
+        if not isinstance(queries, list) or not queries:
+            raise ValueError("Missing search queries")
+        profile["search_queries"] = [
+            str(query).strip() for query in queries[:2] if str(query).strip()
+        ]
+        if not profile["search_queries"]:
+            raise ValueError("Empty search queries")
+        return profile
+    except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+        words = description.split()
+        return {
+            "customs_nature": "unknown",
+            "material": "unknown",
+            "function": "unknown",
+            "search_queries": [" ".join(words[:5])],
+        }
 
 
 def _parse_classification(content: str) -> dict:
@@ -241,16 +296,47 @@ def _request_unknown_code_correction(messages: list, invalid_code: str) -> dict:
 
 def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
     valid_codes = valid_codes if valid_codes is not None else get_valid_codes()
+    print("Building customs abstraction...", flush=True)
+    profile = _abstract_product(query)
+    initial_searches = []
+    for search_query in profile["search_queries"]:
+        initial_searches.append({
+            "query": search_query,
+            "hits": search_nomenclature_tool(search_query, limit=5),
+        })
+    print("Customs abstraction:", profile)
+    print("Initial search results:", initial_searches)
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": query},
+        {
+            "role": "user",
+            "content": (
+                f"PRODUCT DESCRIPTION:\n{query}\n\n"
+                "PRECOMPUTED CUSTOMS ABSTRACTION AND SEARCH RESULTS:\n"
+                f"{json.dumps({'profile': profile, 'searches': initial_searches}, ensure_ascii=False)}\n\n"
+                "Use these results first. Do not repeat the precomputed "
+                "queries. Call tools only to explore a promising parent code "
+                "or to make a materially different search."
+            ),
+        },
     ]
     response = _chat(messages=messages, tools=TOOLS)
     messages.append(response.message)
 
     tool_round = 0
     seen_tool_calls = set()
+    for search_query in profile["search_queries"]:
+        seen_tool_calls.add((
+            "search_nomenclature_tool",
+            json.dumps({"query": search_query}, sort_keys=True),
+        ))
+        seen_tool_calls.add((
+            "search_nomenclature_tool",
+            json.dumps({"query": search_query, "limit": 5}, sort_keys=True),
+        ))
     terminal_code = None
+    stop_tools = False
     pending_calls = _tool_calls(response.message)
     while pending_calls and tool_round < MAX_TOOL_CALLS:
         for tool_call in pending_calls:
@@ -294,6 +380,7 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
                         "get_subcategories, or finish as uncertain."
                     ),
                 }
+                stop_tools = True
             else:
                 seen_tool_calls.add(signature)
                 try:
@@ -310,14 +397,14 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
                 "content": json.dumps(tool_result, ensure_ascii=False),
             })
 
-        if terminal_code is not None:
+        if terminal_code is not None or stop_tools:
             break
         tool_round += 1
         response = _chat(messages=messages, tools=TOOLS)
         messages.append(response.message)
         pending_calls = _tool_calls(response.message)
 
-    if pending_calls and terminal_code is None:
+    if pending_calls and terminal_code is None and not stop_tools:
         raise ValueError(
             f"Nombre de tours d'appels d'outils dépassé ({MAX_TOOL_CALLS})"
         )
