@@ -2,23 +2,24 @@
 import re
 
 
-def calculate_reward(predicted_code: str | None,true_code: str,valid_codes: set[str] | None = None) -> float:
-    """Calcule une récompense selon la hiérarchie douanière, on donne une récompense proportionnelle à son niveau de réponse dans la hiérarchie."""
+def calculate_reward(
+    predicted_code: str | None,
+    true_code: str,
+    valid_codes: set[str] | None = None,
+) -> float:
+    """Reward the longest correct CN prefix; validity is measured separately."""
     if predicted_code is None:
         return 0.0
     if not re.fullmatch(r"\d{8}", predicted_code):
-        return 0.0
-
-    if valid_codes is not None and predicted_code not in valid_codes:
         return 0.0
 
     if predicted_code == true_code:
         return 1.0
 
     rewards = {
-        6: 0.6, 
-        4: 0.3, 
-        2: 0.1, 
+        6: 0.6,
+        4: 0.4,
+        2: 0.2,
     }
 
     for depth, reward in rewards.items():

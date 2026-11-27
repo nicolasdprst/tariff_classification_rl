@@ -90,6 +90,7 @@ OUTPUT_SCHEMA = {
 ABSTRACTION_SCHEMA = {
     "type": "object",
     "properties": {
+        "head_noun": {"type": "string"},
         "customs_nature": {"type": "string"},
         "material": {"type": "string"},
         "function": {"type": "string"},
@@ -100,7 +101,13 @@ ABSTRACTION_SCHEMA = {
             "maxItems": 2,
         },
     },
-    "required": ["customs_nature", "material", "function", "search_queries"],
+    "required": [
+        "head_noun",
+        "customs_nature",
+        "material",
+        "function",
+        "search_queries",
+    ],
     "additionalProperties": False,
 }
 
@@ -160,11 +167,18 @@ def _structured_response(messages: list[dict], terminal_code: str | None = None)
 def _abstract_product(description: str) -> dict:
     """Extract stable customs concepts before lexical retrieval."""
     prompt = (
-        "Abstract this product into customs-search terminology. Focus on what "
-        "the product is, its material, and its primary function. Ignore brands, "
-        "certifications, marketing language, dimensions, and intended users. "
+        "Abstract this product into customs-search terminology. First identify "
+        "the head noun: the simplest generic noun phrase stating what the item "
+        "is. Do not include shape, colour, certifications, applications, users, "
+        "or descriptive adjectives in head_noun. Then identify its material and "
+        "primary function. Ignore brands, marketing language and dimensions. "
+        "Use a broad commodity category likely to occur in a customs heading: "
+        "for example 'dog food' rather than 'chewy treat', 'furniture part' "
+        "rather than 'chrome-plated base', 'grinding wheel' rather than 'round "
+        "disc', and 'culture media' rather than 'stem-cell medium'. "
         "Provide one or two short search queries of 2-5 generic commodity "
-        "terms. Prefer nomenclature wording over wording copied from the "
+        "terms, built around the head noun. Prefer nomenclature wording over "
+        "wording copied from the "
         f"description.\n\nPRODUCT DESCRIPTION:\n{description}"
     )
     response = chat(
@@ -176,6 +190,10 @@ def _abstract_product(description: str) -> dict:
     )
     try:
         profile = json.loads(response.message.content)
+        head_noun = str(profile.get("head_noun", "")).strip()
+        if not head_noun:
+            raise ValueError("Missing head noun")
+        profile["head_noun"] = head_noun
         queries = profile.get("search_queries")
         if not isinstance(queries, list) or not queries:
             raise ValueError("Missing search queries")
@@ -188,6 +206,7 @@ def _abstract_product(description: str) -> dict:
     except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
         words = description.split()
         return {
+            "head_noun": " ".join(words[:2]),
             "customs_nature": "unknown",
             "material": "unknown",
             "function": "unknown",
@@ -298,8 +317,12 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
     valid_codes = valid_codes if valid_codes is not None else get_valid_codes()
     print("Building customs abstraction...", flush=True)
     profile = _abstract_product(query)
+    retrieval_queries = list(dict.fromkeys([
+        profile["head_noun"],
+        *profile["search_queries"],
+    ]))
     initial_searches = []
-    for search_query in profile["search_queries"]:
+    for search_query in retrieval_queries:
         initial_searches.append({
             "query": search_query,
             "hits": search_nomenclature_tool(search_query, limit=5),
@@ -326,7 +349,7 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
 
     tool_round = 0
     seen_tool_calls = set()
-    for search_query in profile["search_queries"]:
+    for search_query in retrieval_queries:
         seen_tool_calls.add((
             "search_nomenclature_tool",
             json.dumps({"query": search_query}, sort_keys=True),
