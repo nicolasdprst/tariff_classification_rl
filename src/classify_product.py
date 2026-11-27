@@ -1,7 +1,7 @@
 import json
 from types import SimpleNamespace
 
-from ollama import chat
+from ollama import Client
 
 from src.code_validation import get_valid_taric_prefix, validate_cn8
 from src.get_subcategories import get_subcategories
@@ -10,6 +10,12 @@ from src.meilisearch.index_nomenclature import search_nomenclature_tool
 
 
 MODEL = "qwen3:1.7b"
+OLLAMA_TIMEOUT_SECONDS = 180
+MAX_INITIAL_CANDIDATES = 8
+MAX_RESPONSE_TOKENS = 1024
+
+# A stalled local generation must not block an entire evaluation indefinitely.
+chat = Client(timeout=OLLAMA_TIMEOUT_SECONDS).chat
 
 SYSTEM_PROMPT = """
 You are an EU customs classification assistant.
@@ -94,6 +100,14 @@ ABSTRACTION_SCHEMA = {
         "customs_nature": {"type": "string"},
         "material": {"type": "string"},
         "function": {"type": "string"},
+        "physical_form": {
+            "type": "string",
+            "enum": [
+                "complete_article", "machine", "part", "material",
+                "preparation", "food", "other",
+            ],
+        },
+        "parent_product": {"type": "string"},
         "search_queries": {
             "type": "array",
             "items": {"type": "string"},
@@ -106,6 +120,8 @@ ABSTRACTION_SCHEMA = {
         "customs_nature",
         "material",
         "function",
+        "physical_form",
+        "parent_product",
         "search_queries",
     ],
     "additionalProperties": False,
@@ -117,11 +133,14 @@ def _chat(messages: list[dict], tools=None, structured: bool = False):
     arguments = {
         "model": MODEL,
         "messages": messages,
-        "options": {"temperature": 0},
+        "options": {
+            "temperature": 0,
+            "num_predict": MAX_RESPONSE_TOKENS,
+        },
     }
     if tools is not None:
         arguments["tools"] = tools
-        arguments["think"] = True
+        arguments["think"] = False
     if structured:
         arguments["format"] = OUTPUT_SCHEMA
     return chat(**arguments)
@@ -171,13 +190,19 @@ def _abstract_product(description: str) -> dict:
         "the head noun: the simplest generic noun phrase stating what the item "
         "is. Do not include shape, colour, certifications, applications, users, "
         "or descriptive adjectives in head_noun. Then identify its material and "
-        "primary function. Ignore brands, marketing language and dimensions. "
+        "primary function. Also identify its physical customs form: a complete "
+        "article, machine, part, material, preparation, food, or other. If it "
+        "is an identifiable part, state its parent product; otherwise use an "
+        "empty string. Ignore brands, marketing language and dimensions. "
         "Use a broad commodity category likely to occur in a customs heading: "
         "for example 'dog food' rather than 'chewy treat', 'furniture part' "
         "rather than 'chrome-plated base', 'grinding wheel' rather than 'round "
         "disc', and 'culture media' rather than 'stem-cell medium'. "
         "Provide one or two short search queries of 2-5 generic commodity "
-        "terms, built around the head noun. Prefer nomenclature wording over "
+        "terms, built around the head noun. Each query must describe the goods "
+        "themselves, not a machine that uses them or a vague class such as "
+        "'chemical product', 'biological product', 'food', or 'mobility aid'. "
+        "Prefer nomenclature wording over "
         "wording copied from the "
         f"description.\n\nPRODUCT DESCRIPTION:\n{description}"
     )
@@ -210,8 +235,80 @@ def _abstract_product(description: str) -> dict:
             "customs_nature": "unknown",
             "material": "unknown",
             "function": "unknown",
+            "physical_form": "other",
+            "parent_product": "",
             "search_queries": [" ".join(words[:5])],
         }
+
+
+def _build_retrieval_queries(profile: dict) -> list[str]:
+    """Build at most three focused queries from the customs abstraction."""
+    head_noun = str(profile.get("head_noun", "")).strip()
+
+    def usable(value: str) -> bool:
+        return bool(value) and value.casefold() not in {"unknown", "none", "n/a"}
+
+    # Nature and material remain decision evidence, but searching broad labels
+    # such as "chemical product" created many irrelevant lexical matches.
+    candidates = [head_noun]
+    candidates.extend(profile.get("search_queries") or [])
+
+    queries = []
+    seen = set()
+    for candidate in candidates:
+        query = " ".join(str(candidate).split())
+        normalized = query.casefold()
+        if usable(query) and normalized not in seen:
+            seen.add(normalized)
+            queries.append(query)
+        if len(queries) == 3:
+            break
+    return queries
+
+
+def _consolidate_searches(
+    searches: list[dict], limit: int = MAX_INITIAL_CANDIDATES
+) -> list[dict]:
+    """Deduplicate and rank hits while retaining their query evidence."""
+    candidates: list[dict] = []
+    by_code: dict[str, dict] = {}
+    for search in searches:
+        query = search["query"]
+        for hit_rank, hit in enumerate(search["hits"]):
+            normalized = "".join(
+                character for character in str(hit.get("code", ""))
+                if character.isdigit()
+            )
+            key = normalized or str(hit.get("code", ""))
+            if key in by_code:
+                if query not in by_code[key]["matched_queries"]:
+                    by_code[key]["matched_queries"].append(query)
+                by_code[key]["_best_hit_rank"] = min(
+                    by_code[key]["_best_hit_rank"], hit_rank
+                )
+                continue
+            candidate = {
+                field: hit.get(field)
+                for field in (
+                    "code", "text", "hierarchy_text", "ancestor_codes", "unit"
+                )
+            }
+            candidate["matched_queries"] = [query]
+            candidate["_best_hit_rank"] = hit_rank
+            candidate["_discovery_order"] = len(candidates)
+            by_code[key] = candidate
+            candidates.append(candidate)
+
+    candidates.sort(key=lambda candidate: (
+        -len(candidate["matched_queries"]),
+        candidate["_best_hit_rank"],
+        candidate["_discovery_order"],
+    ))
+    selected = candidates[:limit]
+    for candidate in selected:
+        candidate.pop("_best_hit_rank")
+        candidate.pop("_discovery_order")
+    return selected
 
 
 def _parse_classification(content: str) -> dict:
@@ -317,18 +414,17 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
     valid_codes = valid_codes if valid_codes is not None else get_valid_codes()
     print("Building customs abstraction...", flush=True)
     profile = _abstract_product(query)
-    retrieval_queries = list(dict.fromkeys([
-        profile["head_noun"],
-        *profile["search_queries"],
-    ]))
+    retrieval_queries = _build_retrieval_queries(profile)
     initial_searches = []
     for search_query in retrieval_queries:
         initial_searches.append({
             "query": search_query,
             "hits": search_nomenclature_tool(search_query, limit=5),
         })
+    initial_candidates = _consolidate_searches(initial_searches)
     print("Customs abstraction:", profile)
     print("Initial search results:", initial_searches)
+    print("Consolidated candidates:", initial_candidates)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -337,10 +433,14 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
             "content": (
                 f"PRODUCT DESCRIPTION:\n{query}\n\n"
                 "PRECOMPUTED CUSTOMS ABSTRACTION AND SEARCH RESULTS:\n"
-                f"{json.dumps({'profile': profile, 'searches': initial_searches}, ensure_ascii=False)}\n\n"
+                f"{json.dumps({'profile': profile, 'candidates': initial_candidates}, ensure_ascii=False)}\n\n"
                 "Use these results first. Do not repeat the precomputed "
                 "queries. Call tools only to explore a promising parent code "
-                "or to make a materially different search."
+                "or to make a materially different search. First distinguish "
+                "the physical form of the goods: do not classify a consumable "
+                "or component as the machine that uses it. If the profile says "
+                "the goods are a part, consider classification with the parent "
+                "product before classifying only by constituent material."
             ),
         },
     ]
@@ -359,7 +459,6 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
             json.dumps({"query": search_query, "limit": 5}, sort_keys=True),
         ))
     terminal_code = None
-    stop_tools = False
     pending_calls = _tool_calls(response.message)
     while pending_calls and tool_round < MAX_TOOL_CALLS:
         for tool_call in pending_calls:
@@ -396,14 +495,14 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
             signature = (tool_name, json.dumps(arguments, sort_keys=True))
             if signature in seen_tool_calls:
                 tool_result = {
-                    "error": "Repeated tool call rejected.",
+                    "error": "Precomputed search already provided.",
                     "instruction": (
-                        "Do not repeat this search. Explore the most relevant "
-                        "2-, 4-, or 6-digit code already returned with "
-                        "get_subcategories, or finish as uncertain."
+                        "Do not repeat this search. On the next turn, explore "
+                        "the most relevant 2-, 4-, or 6-digit code already "
+                        "returned with get_subcategories, or finish as "
+                        "uncertain."
                     ),
                 }
-                stop_tools = True
             else:
                 seen_tool_calls.add(signature)
                 try:
@@ -420,14 +519,14 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
                 "content": json.dumps(tool_result, ensure_ascii=False),
             })
 
-        if terminal_code is not None or stop_tools:
+        if terminal_code is not None:
             break
         tool_round += 1
         response = _chat(messages=messages, tools=TOOLS)
         messages.append(response.message)
         pending_calls = _tool_calls(response.message)
 
-    if pending_calls and terminal_code is None and not stop_tools:
+    if pending_calls and terminal_code is None:
         raise ValueError(
             f"Nombre de tours d'appels d'outils dépassé ({MAX_TOOL_CALLS})"
         )

@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 meilisearch.exe
 data/meilisearch_data/
+data.ms
