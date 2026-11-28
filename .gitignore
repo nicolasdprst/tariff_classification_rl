@@ -4,3 +4,4 @@ __pycache__/
 meilisearch.exe
 data/meilisearch_data/
 data.ms
+.model_cache/

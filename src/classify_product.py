@@ -1,97 +1,91 @@
-import json
-from types import SimpleNamespace
 
+
+import json
+import re
 from ollama import Client
 
-from src.code_validation import get_valid_taric_prefix, validate_cn8
+from src.code_validation import normalize_customs_code, validate_cn8
 from src.get_subcategories import get_subcategories
 from src.get_valid_codes import get_valid_codes
+from src.model_cache import cached_chat
 from src.meilisearch.index_nomenclature import search_nomenclature_tool
+from src.hybrid_retrieval import retrieve, clean_description
+from src.nomenclature_tree import get_tree
 
 
 MODEL = "qwen3:1.7b"
 OLLAMA_TIMEOUT_SECONDS = 180
-MAX_INITIAL_CANDIDATES = 8
-MAX_RESPONSE_TOKENS = 1024
+MAX_INITIAL_CANDIDATES = 20
+NOMENCLATURE_HITS_PER_QUERY = 10
+MAX_SELECTION_TOKENS = 128
 
-# A stalled local generation must not block an entire evaluation indefinitely.
-chat = Client(timeout=OLLAMA_TIMEOUT_SECONDS).chat
+CN_SECTIONS = [
+    #sections pour les codes à 2 chiffres
+    ("I", 1, 5, "Live animals and animal products"),
+    ("II", 6, 14, "Vegetable products"),
+    ("III", 15, 15, "Animal, vegetable or microbial fats and oils"),
+    ("IV", 16, 24, "Prepared food, beverages and tobacco"),
+    ("V", 25, 27, "Mineral products"),
+    ("VI", 28, 38, "Chemical products"),
+    ("VII", 39, 40, "Plastics and rubber"),
+    ("VIII", 41, 43, "Hides, leather, furskins and articles thereof"),
+    ("IX", 44, 46, "Wood, cork and basketware"),
+    ("X", 47, 49, "Pulp, paper and printed products"),
+    ("XI", 50, 63, "Textiles and textile articles"),
+    ("XII", 64, 67, "Footwear, headgear, umbrellas and similar articles"),
+    ("XIII", 68, 70, "Stone, ceramics and glass"),
+    ("XIV", 71, 71, "Precious stones, precious metals and jewellery"),
+    ("XV", 72, 83, "Base metals and articles of base metal"),
+    ("XVI", 84, 85, "Machinery and electrical equipment"),
+    ("XVII", 86, 89, "Vehicles and transport equipment"),
+    ("XVIII", 90, 92, "Optical, measuring, medical and musical instruments"),
+    ("XIX", 93, 93, "Arms and ammunition"),
+    ("XX", 94, 96, "Furniture, toys and miscellaneous manufactured articles"),
+    ("XXI", 97, 97, "Works of art, collectors' pieces and antiques"),
+]
+
+chat = cached_chat
 
 SYSTEM_PROMPT = """
 You are an EU customs classification assistant.
 
 Your task is to classify products into the European Combined
-Nomenclature (CN) using the available search tools.
+Nomenclature (CN) by selecting the single best matching category from
+the closed list of official CN options provided to you.
 
-Your final objective is to identify the correct 8-digit CN code.
-
-AVAILABLE TOOLS
-
-1. search_nomenclature_tool(query, limit=5)
-   Searches the official CN nomenclature using keywords.
-
-2. get_subcategories(code)
-   Returns the direct child categories of a CN code.
-   Use it only for codes with 2, 4, or 6 digits.
-   Never call it with an 8-digit code.
-
-SEARCH STRATEGY
-
-1. Start by identifying the product's main nature,
-   material, function, and relevant characteristics.
-2. Search using short, distinctive keywords.
-3. Prefer categories matching the product's function and nature.
-4. If results are irrelevant, reformulate with different keywords.
-5. Explore only a relevant parent code returned by a tool.
-6. Never explore an unrelated code without evidence.
-
-CN CLASSIFICATION RULES
-
-1. CN codes have 2, 4, 6, then 8 hierarchical digits.
-2. Select the most specific classification justified by the evidence.
-3. A final code must explicitly appear in tool results.
-4. Never invent a code or additional digits.
-5. Never confuse 8-digit CN codes with 10-digit TARIC codes.
-6. An empty result does not confirm that a code is valid.
-
-TOOL USAGE RULES
-
-1. Do not repeat an identical unsuccessful tool call.
-2. Adapt after a tool error.
-3. Prefer promising candidates over unrelated categories.
-4. Minimize unnecessary calls and stop once a supported CN8 is found.
-
-UNCERTAINTY
-
-If the evidence does not support a specific CN8 code, do not guess.
-Return an uncertain classification instead.
-
-OUTPUT FORMAT
-
-Return only the requested JSON object. Use an 8-digit CN code, or null when
-uncertain. Do not include Markdown or explanations outside JSON.
+RULES
+1. Choose the most appropriate code from OFFICIAL CANDIDATE CHOICES.
+2. Match the goods by their actual nature, material, and function.
+   Do not classify a consumable, part, or component as the machine that
+   uses it unless the nomenclature classifies parts with the parent product.
+3. Only return status "uncertain" with selected_code null if all listed
+   categories are clearly unrelated to the product.
+4. Return only the requested JSON object.
 """
 
-MAX_TOOL_CALLS = 7
-MAX_CORRECTION_TOOL_CALLS = 3
-TOOLS = [search_nomenclature_tool, get_subcategories]
-TOOL_HANDLERS = {tool.__name__: tool for tool in TOOLS}
 
-OUTPUT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "cn_code": {
-            "anyOf": [
-                {"type": "string", "pattern": "^[0-9]{8}$"},
-                {"type": "null"},
-            ]
+def _selection_schema(allowed_codes: list[str]) -> dict:
+    """Limite la réponse JSON aux codes proposés pour cette étape."""
+    return {
+        "type": "object",
+        "properties": {
+            "selected_code": {
+                "anyOf": [
+                    {"type": "string", "enum": allowed_codes},
+                    {"type": "null"},
+                ]
+            },
+            "status": {
+                "type": "string",
+                "enum": ["selected", "uncertain"],
+            },
         },
-        "description": {"type": "string"},
-        "status": {"type": "string", "enum": ["found", "uncertain"]},
-    },
-    "required": ["cn_code", "description", "status"],
-    "additionalProperties": False,
-}
+        "required": ["selected_code", "status"],
+        "additionalProperties": False,
+    }
+
+
+SELECTION_SCHEMA = _selection_schema([])
 
 ABSTRACTION_SCHEMA = {
     "type": "object",
@@ -128,63 +122,28 @@ ABSTRACTION_SCHEMA = {
 }
 
 
-def _chat(messages: list[dict], tools=None, structured: bool = False):
-    """Keep tool calling and structured output in separate requests."""
-    arguments = {
-        "model": MODEL,
-        "messages": messages,
-        "options": {
-            "temperature": 0,
-            "num_predict": MAX_RESPONSE_TOKENS,
-        },
-    }
-    if tools is not None:
-        arguments["tools"] = tools
-        arguments["think"] = False
-    if structured:
-        arguments["format"] = OUTPUT_SCHEMA
-    return chat(**arguments)
-
-
-def _tool_calls(message) -> list:
-    """Return native calls, or recover Qwen's textual tool-call JSON."""
-    if message.tool_calls:
-        return list(message.tool_calls)
-    try:
-        payload = json.loads((message.content or "").strip())
-    except (json.JSONDecodeError, TypeError):
-        return []
-    if not isinstance(payload, dict):
-        return []
-    name = payload.get("name")
-    arguments = payload.get("arguments")
-    if name not in TOOL_HANDLERS or not isinstance(arguments, dict):
-        return []
-    return [SimpleNamespace(
-        function=SimpleNamespace(name=name, arguments=arguments)
-    )]
-
-
-def _structured_response(messages: list[dict], terminal_code: str | None = None):
-    terminal_instruction = (
-        f" The selected code {terminal_code} is an official terminal CN8; "
-        "return it if it is the intended classification."
-        if terminal_code
-        else ""
+def _chat_selection(messages: list[dict], allowed_codes: list[str] | None = None):
+    """Demande à Qwen un choix court au format JSON contraint."""
+    schema = (
+        _selection_schema(allowed_codes)
+        if allowed_codes
+        else SELECTION_SCHEMA
     )
-    final_messages = messages + [{
-        "role": "user",
-        "content": (
-            "Now return the final classification as the requested JSON object. "
-            "Use only evidence from the tool results."
-            f"{terminal_instruction}"
-        ),
-    }]
-    return _chat(messages=final_messages, structured=True)
+    return chat(
+        model=MODEL,
+        messages=messages,
+        format=schema,
+        think=False,
+        options={
+            "temperature": 0,
+            "num_predict": MAX_SELECTION_TOKENS,
+            "num_ctx": 8192,
+        },
+    )
 
 
 def _abstract_product(description: str) -> dict:
-    """Extract stable customs concepts before lexical retrieval."""
+    """Extrait la nature, la matière et des requêtes pour la recherche initiale."""
     prompt = (
         "Abstract this product into customs-search terminology. First identify "
         "the head noun: the simplest generic noun phrase stating what the item "
@@ -211,9 +170,10 @@ def _abstract_product(description: str) -> dict:
         messages=[{"role": "user", "content": prompt}],
         format=ABSTRACTION_SCHEMA,
         think=False,
-        options={"temperature": 0, "num_predict": 256},
+        options={"temperature": 0, "num_predict": 256, "num_ctx": 8192},
     )
     try:
+        #on vérifie les champs indispensables avant de lancer Meilisearch.
         profile = json.loads(response.message.content)
         head_noun = str(profile.get("head_noun", "")).strip()
         if not head_noun:
@@ -229,6 +189,7 @@ def _abstract_product(description: str) -> dict:
             raise ValueError("Empty search queries")
         return profile
     except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+        # Si Qwen ne rend pas un profil exploitable, on cherche avec le texte brut.
         words = description.split()
         return {
             "head_noun": " ".join(words[:2]),
@@ -242,14 +203,13 @@ def _abstract_product(description: str) -> dict:
 
 
 def _build_retrieval_queries(profile: dict) -> list[str]:
-    """Build at most three focused queries from the customs abstraction."""
+    """Prépare au plus trois requêtes distinctes à partir du profil produit."""
     head_noun = str(profile.get("head_noun", "")).strip()
 
     def usable(value: str) -> bool:
         return bool(value) and value.casefold() not in {"unknown", "none", "n/a"}
 
-    # Nature and material remain decision evidence, but searching broad labels
-    # such as "chemical product" created many irrelevant lexical matches.
+    #on évite d'être trop vague dans la requête sinon on se ramène à des résultats lexicaux hors sujet.
     candidates = [head_noun]
     candidates.extend(profile.get("search_queries") or [])
 
@@ -269,7 +229,7 @@ def _build_retrieval_queries(profile: dict) -> list[str]:
 def _consolidate_searches(
     searches: list[dict], limit: int = MAX_INITIAL_CANDIDATES
 ) -> list[dict]:
-    """Deduplicate and rank hits while retaining their query evidence."""
+    """Fusionne les réponses Meilisearch sans perdre les requêtes associées."""
     candidates: list[dict] = []
     by_code: dict[str, dict] = {}
     for search in searches:
@@ -300,6 +260,7 @@ def _consolidate_searches(
             candidates.append(candidate)
 
     candidates.sort(key=lambda candidate: (
+        #un code retrouvé par plusieurs requêtes passe avant un code isolé.
         -len(candidate["matched_queries"]),
         candidate["_best_hit_rank"],
         candidate["_discovery_order"],
@@ -311,120 +272,240 @@ def _consolidate_searches(
     return selected
 
 
-def _parse_classification(content: str) -> dict:
-    try:
-        result = json.loads(content)
-    except json.JSONDecodeError as err:
-        raise ValueError(
-            "Erreur de parsing JSON, le modèle n'a pas retourné un JSON "
-            f"correct : {err}"
-        ) from err
-
-    required = {"cn_code", "description", "status"}
-    if not isinstance(result, dict):
-        raise ValueError("La réponse JSON doit être un objet")
-    if not required.issubset(result):
-        raise ValueError(f"Champs manquants : {required - result.keys()}")
-    if result["status"] not in {"found", "uncertain"}:
-        raise ValueError(f"Statut invalide : {result['status']}")
-    if result["cn_code"] is not None and not isinstance(result["cn_code"], str):
-        raise ValueError("cn_code doit être une chaîne ou null")
-    if not isinstance(result["description"], str):
-        raise ValueError("description doit être une chaîne")
-    return result
+def _candidate_codes(candidates: list[dict]) -> list[str]:
+    """Récupère les codes distincts présents dans la recherche initiale."""
+    codes = []
+    seen = set()
+    for candidate in candidates:
+        code = "".join(
+            character
+            for character in str(candidate.get("code", ""))
+            if character.isdigit()
+        )
+        if code and code not in seen:
+            seen.add(code)
+            codes.append(code)
+    return codes
 
 
-def _request_taric_correction(messages: list, candidate: str) -> dict:
-    correction_messages = messages + [{
-        "role": "user",
-        "content": (
-            "FORMAT CORRECTION ONLY: you returned a potential 10-digit TARIC "
-            f"code. Its official CN8 prefix is {candidate}. Return cn_code as "
-            f"exactly \"{candidate}\" if this is the CN code you intended, "
-            "otherwise return cn_code null with status \"uncertain\". Do not "
-            "choose any other code."
-        ),
-    }]
-    corrected = _parse_classification(
-        _chat(messages=correction_messages, structured=True).message.content
-    )
-    if corrected["cn_code"] not in {candidate, None}:
-        raise ValueError("La correction a proposé un autre code")
-    return corrected
+def _extract_candidate_chapters(candidates: list[dict]) -> list[dict]:
+    """Regroupe les résultats initiaux par chapitre CN2."""
+    chapter_hits: dict[str, list[str]] = {}
+    for candidate in candidates:
+        digits = "".join(
+            character
+            for character in str(candidate.get("code", ""))
+            if character.isdigit()
+        )
+        if len(digits) < 2:
+            continue
+        chapter = digits[:2]
+        label = str(
+            candidate.get("hierarchy_text") or candidate.get("text") or ""
+        ).strip()
+        summary = label or f"Chapter {chapter}"
+        bucket = chapter_hits.setdefault(chapter, [])
+        if summary not in bucket and len(bucket) < 3:
+            bucket.append(summary)
+
+    return [
+        {"code": chapter, "label": " | ".join(summaries)}
+        for chapter, summaries in chapter_hits.items()
+    ]
 
 
-def _request_unknown_code_correction(messages: list, invalid_code: str) -> dict:
-    """Run one guided correction attempt, with a separate tool-call limit."""
-    correction_messages = messages + [{
-        "role": "user",
-        "content": (
-            f"CORRECTION REQUIRED: the proposed code {invalid_code} does not "
-            "exist in the official 2026 Combined Nomenclature. Use the "
-            "available search results and subcategories to identify an "
-            "existing CN8 code. You may perform a new search or explore a "
-            "relevant category. Never invent a subdivision and never complete "
-            "a code with arbitrary zeros. If no reliable existing code can be "
-            "identified, return cn_code null and status \"uncertain\"."
-        ),
-    }]
-    response = _chat(messages=correction_messages, tools=TOOLS)
-    correction_messages.append(response.message)
-
-    tool_call_count = 0
-    pending_calls = _tool_calls(response.message)
-    while pending_calls:
-        for tool_call in pending_calls:
-            if tool_call_count >= MAX_CORRECTION_TOOL_CALLS:
-                raise ValueError(
-                    "Nombre d'appels d'outils dépassé pendant la correction "
-                    f"({MAX_CORRECTION_TOOL_CALLS})"
-                )
-            tool_call_count += 1
-            tool_name = tool_call.function.name
-            tool_handler = TOOL_HANDLERS.get(tool_name)
-            arguments = tool_call.function.arguments
-            if tool_handler is None:
-                tool_result = {
-                    "error": f"Unknown tool: {tool_name}",
-                    "invalid_arguments": arguments,
-                }
-            else:
-                try:
-                    tool_result = tool_handler(**arguments)
-                except (TypeError, ValueError) as err:
-                    tool_result = {
-                        "error": str(err),
-                        "invalid_arguments": arguments,
-                    }
-            correction_messages.append({
-                "role": "tool",
-                "tool_name": tool_name,
-                "content": json.dumps(tool_result, ensure_ascii=False),
-            })
-
-        response = _chat(messages=correction_messages, tools=TOOLS)
-        correction_messages.append(response.message)
-        pending_calls = _tool_calls(response.message)
-    return _parse_classification(
-        _structured_response(correction_messages).message.content
-    )
-
-
-def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
-    valid_codes = valid_codes if valid_codes is not None else get_valid_codes()
-    print("Building customs abstraction...", flush=True)
-    profile = _abstract_product(query)
-    retrieval_queries = _build_retrieval_queries(profile)
-    initial_searches = []
-    for search_query in retrieval_queries:
-        initial_searches.append({
-            "query": search_query,
-            "hits": search_nomenclature_tool(search_query, limit=5),
+def _format_subcategory_options(subcategories: list[dict]) -> list[dict]:
+    """Transforme les enfants de l'arbre en choix sans doublons pour Qwen."""
+    options = []
+    seen = set()
+    for item in subcategories:
+        raw_code = str(item.get("CN", ""))
+        code = normalize_customs_code(raw_code)
+        if not code or not code.isdigit() or code in seen:
+            continue
+        seen.add(code)
+        options.append({
+            "code": code,
+            "label": str(item.get("Text", "")).strip(),
         })
-    initial_candidates = _consolidate_searches(initial_searches)
-    print("Customs abstraction:", profile)
-    print("Initial search results:", initial_searches)
-    print("Consolidated candidates:", initial_candidates)
+    return options
+
+
+def _supported_options(options: list[dict], candidates: list[dict]) -> list[dict]:
+    """Repère les enfants dont le préfixe apparaît dans la recherche initiale."""
+    candidate_codes = _candidate_codes(candidates)
+    supported = [
+        option
+        for option in options
+        if any(
+            len(candidate) >= len(option["code"])
+            and candidate.startswith(option["code"])
+            for candidate in candidate_codes
+        )
+    ]
+    return supported or options
+
+
+def _section_options() -> list[dict]:
+    return [
+        {"code": section, "label": label}
+        for section, _start, _end, label in CN_SECTIONS
+    ]
+
+
+def _chapter_options(section_code: str) -> list[dict]:
+    """Présente chaque chapitre avec quelques positions CN4 représentatives."""
+    section = next(
+        (item for item in CN_SECTIONS if item[0] == section_code), None
+    )
+    if section is None:
+        return []
+    _name, start, end, _label = section
+    options = []
+    for chapter_number in range(start, end + 1):
+        chapter = f"{chapter_number:02d}"
+        headings = _format_subcategory_options(get_subcategories(chapter))
+        representative = [
+            heading["label"]
+            for heading in headings
+            if heading["label"].casefold() not in {"other", "others"}
+        ][:4]
+        if representative:
+            options.append({
+                "code": chapter,
+                "label": "Examples of headings: " + " | ".join(representative),
+            })
+    return options
+
+
+def _section_for_chapter(chapter: str) -> str | None:
+    if not chapter.isdigit():
+        return None
+    number = int(chapter)
+    return next(
+        (
+            section
+            for section, start, end, _label in CN_SECTIONS
+            if start <= number <= end
+        ),
+        None,
+    )
+
+
+def _evidence_options(
+    options: list[dict], candidates: list[dict], level: str
+) -> list[dict]:
+    """Garde les sections ou chapitres soutenus par la recherche initiale."""
+    candidate_codes = _candidate_codes(candidates)
+    if level == "section":
+        evidence = {
+            _section_for_chapter(code[:2])
+            for code in candidate_codes
+            if len(code) >= 2
+        }
+    else:
+        evidence = {code[:2] for code in candidate_codes if len(code) >= 2}
+    return [option for option in options if option["code"] in evidence]
+
+
+def _shortlist_options(
+    options: list[dict],
+    query: str,
+    profile: dict,
+    candidates: list[dict],
+    limit: int = 18,
+) -> list[dict]:
+    """Réduit une longue liste d'enfants à partir des mots du produit et des libellés."""
+    if len(options) <= limit:
+        return options
+    candidate_codes = _candidate_codes(candidates)
+    supported_codes = {
+        # On favorise les branches déjà retrouvées par Meilisearch.
+        option["code"]
+        for option in options
+        if any(code.startswith(option["code"]) for code in candidate_codes)
+    }
+    search_text = " ".join([
+        query,
+        str(profile.get("head_noun", "")),
+        str(profile.get("customs_nature", "")),
+        str(profile.get("material", "")),
+        str(profile.get("function", "")),
+        " ".join(profile.get("search_queries") or []),
+    ])
+    def tokens(text: str) -> set[str]:
+        normalized = set()
+        for token in re.findall(r"[a-z0-9]+", text.casefold()):
+            if len(token) > 4 and token.endswith("s") and not token.endswith("ss"):
+                token = token[:-1]
+            normalized.add(token)
+        return normalized
+
+    query_tokens = tokens(search_text)
+
+    def score(option: dict) -> tuple[int, int]:
+        label_tokens = tokens(option["label"])
+        return (
+            int(option["code"] in supported_codes),
+            len(query_tokens & label_tokens),
+        )
+
+    return sorted(options, key=score, reverse=True)[:limit]
+
+
+def _parse_selection(content: str, allowed_codes: set[str]) -> str | None:
+    """Refuse un code absent des choix ou une réponse incertaine/invalide."""
+    try:
+        payload = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    status = payload.get("status")
+    selected_code = payload.get("selected_code")
+
+    if status == "uncertain":
+        return None
+    if status != "selected":
+        return None
+    if not isinstance(selected_code, str) or selected_code not in allowed_codes:
+        return None
+    return selected_code
+
+
+def _level_label(parent_code: str) -> str:
+    """Nomme le niveau de nomenclature demandé à Qwen."""
+    return {
+        2: "CN4 heading (or direct sub-level)",
+        4: "CN6 subheading (or direct CN8)",
+        6: "CN8 tariff code",
+    }.get(len(parent_code), "CN subcategory")
+
+
+def _choose_category(
+    query: str,
+    profile: dict,
+    level_name: str,
+    options: list[dict],
+    path_history: list[dict],
+    evidence_candidates: list[dict] | None = None,
+) -> dict | None:
+    """Fait choisir une catégorie dans une liste fermée à chaque niveau."""
+    if not options:
+        return None
+    if len(options) == 1:
+        # Un seul enfant possible : aucun appel au modèle n'est nécessaire.
+        return options[0]
+
+    path_lines = "\n".join(
+        f"- {step['code']}: {step['label']}" for step in path_history
+    )
+    evidence_candidates = evidence_candidates or []
+    option_lines = "\n".join(
+        f"- {option['code']}: {option['label']}" for option in options
+    )
+    path_section = f"SELECTED PATH SO FAR:\n{path_lines}\n\n" if path_lines else ""
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -432,188 +513,256 @@ def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
             "role": "user",
             "content": (
                 f"PRODUCT DESCRIPTION:\n{query}\n\n"
-                "PRECOMPUTED CUSTOMS ABSTRACTION AND SEARCH RESULTS:\n"
-                f"{json.dumps({'profile': profile, 'candidates': initial_candidates}, ensure_ascii=False)}\n\n"
-                "Use these results first. Do not repeat the precomputed "
-                "queries. Call tools only to explore a promising parent code "
-                "or to make a materially different search. First distinguish "
-                "the physical form of the goods: do not classify a consumable "
-                "or component as the machine that uses it. If the profile says "
-                "the goods are a part, consider classification with the parent "
-                "product before classifying only by constituent material."
+                f"CUSTOMS ABSTRACTION:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
+                f"{path_section}"
+                f"CURRENT LEVEL: {level_name}\n"
+                f"OFFICIAL CANDIDATE CHOICES:\n{option_lines}\n\n"
+                "Pick the best matching code from OFFICIAL CANDIDATE CHOICES. "
+                "Only use status \"uncertain\" "
+                "with selected_code null if none of these categories can "
+                "reasonably apply."
             ),
         },
     ]
-    response = _chat(messages=messages, tools=TOOLS)
-    messages.append(response.message)
 
-    tool_round = 0
-    seen_tool_calls = set()
-    for search_query in retrieval_queries:
-        seen_tool_calls.add((
-            "search_nomenclature_tool",
-            json.dumps({"query": search_query}, sort_keys=True),
-        ))
-        seen_tool_calls.add((
-            "search_nomenclature_tool",
-            json.dumps({"query": search_query, "limit": 5}, sort_keys=True),
-        ))
-    terminal_code = None
-    pending_calls = _tool_calls(response.message)
-    while pending_calls and tool_round < MAX_TOOL_CALLS:
-        for tool_call in pending_calls:
-            tool_name = tool_call.function.name
-            tool_handler = TOOL_HANDLERS.get(tool_name)
-            if tool_handler is None:
-                raise ValueError(f"L'outil souhaité ({tool_name}) n'existe pas")
+    ordered_codes = [option["code"] for option in options]
+    response = _chat_selection(messages, ordered_codes)
+    content = getattr(getattr(response, "message", None), "content", "")
+    allowed_codes = set(ordered_codes)
+    selected_code = _parse_selection(content, allowed_codes)
+    if selected_code is None:
+        return None
 
-            arguments = tool_call.function.arguments
-            print("Arguments générés par le SLM:", arguments)
-            requested_code = ""
-            if tool_name == "get_subcategories":
-                requested_code = "".join(
-                    character
-                    for character in str(arguments.get("code", ""))
-                    if character.isdigit()
-                )
-            if len(requested_code) == 8 and requested_code in valid_codes:
-                terminal_code = requested_code
-                tool_result = {
-                    "terminal_cn8": terminal_code,
-                    "instruction": (
-                        "This is already an official terminal CN8. Stop using "
-                        "tools and return the final classification."
-                    ),
-                }
-                print("Résultats de la recherche:", tool_result)
-                messages.append({
-                    "role": "tool",
-                    "tool_name": tool_name,
-                    "content": json.dumps(tool_result, ensure_ascii=False),
-                })
-                break
-            signature = (tool_name, json.dumps(arguments, sort_keys=True))
-            if signature in seen_tool_calls:
-                tool_result = {
-                    "error": "Precomputed search already provided.",
-                    "instruction": (
-                        "Do not repeat this search. On the next turn, explore "
-                        "the most relevant 2-, 4-, or 6-digit code already "
-                        "returned with get_subcategories, or finish as "
-                        "uncertain."
-                    ),
-                }
-            else:
-                seen_tool_calls.add(signature)
-                try:
-                    tool_result = tool_handler(**arguments)
-                except (TypeError, ValueError) as err:
-                    tool_result = {
-                        "error": str(err),
-                        "invalid_arguments": arguments,
-                    }
-            print("Résultats de la recherche:", tool_result)
-            messages.append({
-                "role": "tool",
-                "tool_name": tool_name,
-                "content": json.dumps(tool_result, ensure_ascii=False),
-            })
+    for option in options:
+        if option["code"] == selected_code:
+            return option
+    return None
 
-        if terminal_code is not None:
-            break
-        tool_round += 1
-        response = _chat(messages=messages, tools=TOOLS)
-        messages.append(response.message)
-        pending_calls = _tool_calls(response.message)
 
-    if pending_calls and terminal_code is None:
-        raise ValueError(
-            f"Nombre de tours d'appels d'outils dépassé ({MAX_TOOL_CALLS})"
-        )
-
-    raw_result = _parse_classification(
-        _structured_response(messages, terminal_code).message.content
-    )
-    raw_code = raw_result["cn_code"]
-    raw_normalized, raw_code_status = validate_cn8(raw_code, valid_codes)
-
-    result = dict(raw_result)
-    result.update({
-        "raw_cn_code": raw_code,
-        "raw_status": raw_result["status"],
+def _uncertain_result(
+    initial_candidate_codes: list[str],
+    valid_codes: set[str],
+    raw_cn_code: str | None = None,
+    raw_status: str = "uncertain",
+    raw_code_status: str = "Il manque le code",
+) -> dict:
+    """Construit la réponse lorsque le parcours ne peut pas valider un CN8."""
+    _, code_status = validate_cn8(None, valid_codes)
+    return {
+        "cn_code": None,
+        "description": "",
+        "status": "uncertain",
+        "code_status": code_status,
+        "raw_cn_code": raw_cn_code,
+        "raw_status": raw_status,
         "raw_code_status": raw_code_status,
         "correction_attempted": False,
         "correction_success": False,
         "correction_applied": False,
         "correction_method": None,
-    })
+        "initial_candidate_codes": initial_candidate_codes,
+    }
 
-    candidate = get_valid_taric_prefix(raw_code, valid_codes)
-    if candidate is not None:
-        result["correction_attempted"] = True
-        try:
-            corrected = _request_taric_correction(messages, candidate)
-            corrected_code, corrected_status = validate_cn8(
-                corrected["cn_code"], valid_codes
-            )
-            corrected["status"] = (
-                "found" if corrected_status == "valid" else "uncertain"
-            )
-            result.update(corrected)
-            result["cn_code"] = corrected_code
-            result["correction_success"] = corrected_status == "valid"
-            result["correction_applied"] = result["correction_success"]
-            result["correction_method"] = (
-                "model_confirmed_taric_cn8_prefix"
-                if corrected_code == candidate
-                else "model_rejected_taric_cn8_prefix"
-            )
-        except (ValueError, TypeError) as err:
-            result["cn_code"] = raw_normalized
-            result["correction_method"] = "taric_correction_failed"
-            result["correction_error"] = str(err)
-    elif raw_code_status == "Format valide mais code inconnu":
-        result["correction_attempted"] = True
-        try:
-            corrected = _request_unknown_code_correction(
-                messages, raw_normalized
-            )
-            corrected_code, corrected_status = validate_cn8(
-                corrected["cn_code"], valid_codes
-            )
-            if corrected_status == "valid":
-                result.update(corrected)
-                result["cn_code"] = corrected_code
-                result["status"] = "found"
-                result["correction_success"] = True
-                result["correction_applied"] = True
-                result["correction_method"] = "model_corrected_unknown_cn8"
-            else:
-                result["cn_code"] = None
-                result["description"] = ""
-                result["status"] = "uncertain"
-                result["correction_method"] = (
-                    "model_uncertain_after_unknown_cn8"
-                    if corrected["cn_code"] is None
-                    else "second_unknown_cn8_rejected"
-                )
-        except Exception as err:
-            result["cn_code"] = None
-            result["description"] = ""
-            result["status"] = "uncertain"
-            result["correction_method"] = "unknown_cn8_correction_failed"
-            result["correction_error"] = str(err)
-    else:
-        result["cn_code"] = raw_normalized
-        if (
-            isinstance(raw_normalized, str)
-            and len(raw_normalized) == 10
-            and raw_normalized.isdigit()
-        ):
-            result["correction_method"] = "taric_prefix_not_in_nomenclature"
 
-    _, result["code_status"] = validate_cn8(result["cn_code"], valid_codes)
-    return result
+def classify_product_rerank(query: str, valid_codes: set[str] | None = None,
+                            product_id: str | None = None,
+                            retrieval_mode: str = "lexical",
+                            shuffle_seed: int | None = None,
+                            think: bool = False) -> dict:
+    """Choisit un seul CN8 parmi les candidats officiels avec un appel Qwen."""
+    import random
+
+    valid_codes = valid_codes if valid_codes is not None else get_valid_codes()
+    candidates, neighbours = retrieve(
+        query, k_nomenclature=35, k_train=5, product_id=product_id,
+        embedding_mode=retrieval_mode,
+    )
+    candidates = [candidate for candidate in candidates if candidate["code"] in valid_codes][:40]
+    #on nenvoie que des cn8 valides
+    if not candidates:
+        raise RuntimeError("Retriever returned no valid CN8 candidates")
+    ranked_codes = [candidate["code"] for candidate in candidates]
+    branch_scores = {}
+    for candidate in candidates:
+        prefix = candidate["code"][:4]
+        branch_scores[prefix] = branch_scores.get(prefix, 0.0) + candidate["score"]
+    best_branch = max(branch_scores, key=branch_scores.get)
+    fallback = next(code for code in ranked_codes if code.startswith(best_branch))
+    presented = candidates[:]
+    if shuffle_seed is not None:
+        #Le mélange sert à mesurer l'effet de l'ordre des options sur Qwen -> voir résultat qwen 1.7b
+        random.Random(shuffle_seed).shuffle(presented)
+    # Les voisins sont des exemples de réérence ; leurs descriptions sont tronquée.
+    neighbour_lines = [
+        f"{row['cn_code']}: {clean_description(row['product_description'])[:220]}"
+        for row in neighbours[:3]
+    ]
+    options = "\n".join(f"{item['code']}: {item['hierarchy']}" for item in presented)
+    schema = {
+        # Le schéma contraint la réponse à l'un des codes effectivement proposé
+        "type": "object",
+        "properties": {"selected_code": {"type": "string", "enum": ranked_codes}},
+        "required": ["selected_code"], "additionalProperties": False,
+    }
+    messages = [
+        {"role": "system", "content": "Classify the goods under the EU Combined Nomenclature. Select exactly one offered CN8 code. Match the goods' nature, material and function; distinguish parts, consumables and complete machines. Return JSON only."},
+        {"role": "user", "content": (
+            f"GOODS:\n{clean_description(query)}\n\n"
+            f"SIMILAR TRAINING RULINGS (examples, not answers):\n" + "\n".join(neighbour_lines) +
+            f"\n\nOFFICIAL CN8 OPTIONS:\n{options}\n\nChoose the single best code."
+        )},
+    ]
+    response = chat(model=MODEL, messages=messages, format=schema,
+                    think=think, options={"temperature": 0,
+                                          "num_predict": 512 if think else 128,
+                                          "num_ctx": 8192})
+    try:
+        selected = json.loads(response.message.content)["selected_code"]
+    except (ValueError, TypeError, KeyError, AttributeError):
+        selected = fallback
+    if selected not in ranked_codes:
+        selected = fallback
+    # On conserve les candidats présentés pour analyser ensuite les erreurs
+    tree = get_tree()
+    return {
+        "cn_code": selected, "description": tree.labels[selected],
+        "status": "found", "code_status": "valid", "raw_cn_code": selected,
+        "raw_status": "found", "raw_code_status": "valid",
+        "correction_attempted": False, "correction_success": False,
+        "correction_applied": False, "correction_method": None,
+        "initial_candidate_codes": ranked_codes,
+        "candidate_details": presented,
+    }
+
+
+def classify_product(query: str, valid_codes: set[str] | None = None) -> dict:
+    """Ancien parcours : section, chapitre puis enfants successifs jusqu'au CN8"""
+    valid_codes = valid_codes if valid_codes is not None else get_valid_codes()
+    # Qwen reformule le produit, puis Meilisearch cherche ses termes principau
+    print("Building customs abstraction...", flush=True)
+    profile = _abstract_product(query)
+    retrieval_queries = _build_retrieval_queries(profile)
+    initial_searches = []
+    for search_query in retrieval_queries:
+        initial_searches.append({
+            "query": search_query,
+            "hits": search_nomenclature_tool(
+                search_query, limit=NOMENCLATURE_HITS_PER_QUERY
+            ),
+        })
+    initial_candidates = _consolidate_searches(initial_searches)
+    initial_candidate_codes = _candidate_codes(initial_candidates)
+    print("Customs abstraction:", profile)
+    print("Initial search results:", initial_searches)
+    print("Consolidated candidates:", initial_candidates)
+
+    section_options = _section_options()
+    # Premier choix de section, puis second choix avec les indices de recherche
+    section = _choose_category(
+        query=query,
+        profile=profile,
+        level_name="CN section",
+        options=section_options,
+        path_history=[],
+    )
+    if section is None:
+        return _uncertain_result(initial_candidate_codes, valid_codes)
+
+    section_evidence = _evidence_options(
+        section_options, initial_candidates, "section"
+    )
+    if section not in section_evidence:
+        section_evidence.append(section)
+    refined_section = _choose_category(
+        query=query,
+        profile=profile,
+        level_name="CN section (final choice using search evidence)",
+        options=section_evidence,
+        path_history=[],
+    )
+    if refined_section is not None:
+        section = refined_section
+
+    chapter_options = _chapter_options(section["code"])
+    # On applique le même principe au chapitre, dans la section sélectionnée.
+    selected = _choose_category(
+        query=query,
+        profile=profile,
+        level_name="CN chapter (2-digit)",
+        options=chapter_options,
+        path_history=[section],
+    )
+    if selected is None:
+        return _uncertain_result(initial_candidate_codes, valid_codes)
+
+    chapter_evidence = _evidence_options(
+        chapter_options, initial_candidates, "chapter"
+    )
+    if selected not in chapter_evidence:
+        chapter_evidence.append(selected)
+    refined_chapter = _choose_category(
+        query=query,
+        profile=profile,
+        level_name="CN chapter (final choice using search evidence)",
+        options=chapter_evidence,
+        path_history=[section],
+    )
+    if refined_chapter is not None:
+        selected = refined_chapter
+
+    path_history = [section, selected]
+    current_code = selected["code"]
+    last_allowed_codes = {opt["code"] for opt in chapter_options}
+
+    while len(current_code) < 8:
+        # Chaque réponse fixe le parent de l'étape suivante : pas de retour en arrière.
+        subcategories = get_subcategories(current_code)
+        options = _format_subcategory_options(subcategories)
+        options = _shortlist_options(
+            options, query, profile, initial_candidates
+        )
+        selected = _choose_category(
+            query=query,
+            profile=profile,
+            level_name=_level_label(current_code),
+            options=options,
+            path_history=path_history,
+            evidence_candidates=initial_candidates,
+        )
+        if selected is None:
+            return _uncertain_result(initial_candidate_codes, valid_codes)
+        path_history.append(selected)
+        current_code = selected["code"]
+        last_allowed_codes = {opt["code"] for opt in options}
+
+    if len(current_code) != 8 or current_code not in last_allowed_codes:
+        return _uncertain_result(initial_candidate_codes, valid_codes)
+
+    # Le code terminal doit appartenir à la nomenclature officielle chargé
+    normalized_code, code_status = validate_cn8(current_code, valid_codes)
+    if code_status != "valid":
+        return _uncertain_result(
+            initial_candidate_codes,
+            valid_codes,
+            raw_cn_code=current_code,
+            raw_status="found",
+            raw_code_status=code_status,
+        )
+
+    return {
+        "cn_code": normalized_code,
+        "description": selected["label"],
+        "status": "found",
+        "code_status": code_status,
+        "raw_cn_code": current_code,
+        "raw_status": "found",
+        "raw_code_status": code_status,
+        "correction_attempted": False,
+        "correction_success": False,
+        "correction_applied": False,
+        "correction_method": None,
+        "initial_candidate_codes": initial_candidate_codes,
+    }
 
 
 if __name__ == "__main__":
